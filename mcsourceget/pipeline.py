@@ -252,7 +252,7 @@ def process_version(
 
     if arts.kind == MappingKind.MOJANG:
         jar_to_decompile = _remap_mojang(client_jar, arts, entry.id)
-    elif arts.kind in (MappingKind.YARN, MappingKind.LEGACY_YARN):
+    elif arts.kind in (MappingKind.YARN, MappingKind.LEGACY_YARN, MappingKind.ORNITHE):
         jar_to_decompile = _remap_yarn(client_jar, arts, entry.id)
     elif arts.kind == MappingKind.MCP:
         jar_to_decompile = _remap_mcp(client_jar, arts, entry.id)

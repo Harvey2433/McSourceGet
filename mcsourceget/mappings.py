@@ -21,7 +21,8 @@ import requests
 from .config import (
     FABRIC_MAVEN, FABRIC_META, HTTP_HEADERS, HTTP_TIMEOUT, MAP_CACHE,
     MCP_SRG_URL, MCP_SRG_VERSIONS, MCP_CSV_CHANNELS, MCP_CSV_METADATA, MCP_CSV_URL,
-    MCP_LEGACY_MAPPINGS, LEGACY_FABRIC_META, LEGACY_FABRIC_MAVEN, SESSION,
+    MCP_LEGACY_MAPPINGS, LEGACY_FABRIC_META, LEGACY_FABRIC_MAVEN,
+    ORNITHE_META, ORNITHE_MAVEN, SESSION,
 )
 from .manifest import VersionEntry
 
@@ -30,6 +31,7 @@ class MappingKind(enum.Enum):
     MOJANG = "mojang"
     YARN = "yarn"
     LEGACY_YARN = "legacy_yarn"
+    ORNITHE = "ornithe"
     MCP = "mcp"
     MCP_LEGACY = "mcp_legacy"
     MCP_REBORN = "mcp_reborn"
@@ -41,6 +43,7 @@ class MappingKind(enum.Enum):
             MappingKind.MOJANG: "Mojang official mapping",
             MappingKind.YARN: "Yarn (community, friendly names + param names)",
             MappingKind.LEGACY_YARN: "Legacy Yarn (Legacy Fabric, 1.3~1.13)",
+            MappingKind.ORNITHE: "OrnitheMC Mapping (Calamus + Feather, ~1.3~1.14.4)",
             MappingKind.MCP: "MCP (classic SRG + CSV names)",
             MappingKind.MCP_LEGACY: "MCP Legacy (RetroMCP bundled tiny mapping)",
             MappingKind.MCP_REBORN: "MCP-Reborn (Gradle project)",
@@ -187,6 +190,76 @@ def _resolve_legacy_yarn(entry: VersionEntry) -> list[tuple[Path, str, str]]:
     return downloads
 
 
+# ---------------------------------------------------------------------------
+# OrnitheMC（~1.3~1.14.4）：Calamus(intermediary) + Feather(named)，两步重映射
+# ---------------------------------------------------------------------------
+_ornithe_feather_versions_cache: Optional[set] = None
+
+
+def _ornithe_feather_versions() -> set:
+    """Ornithe Feather 覆盖的全部 gameVersion，缓存（网络失败回空集）。"""
+    global _ornithe_feather_versions_cache
+    if _ornithe_feather_versions_cache is None:
+        try:
+            data = _get_json(f"{ORNITHE_META}/versions/feather")
+            _ornithe_feather_versions_cache = {b["gameVersion"] for b in data if b.get("gameVersion")}
+        except Exception:
+            _ornithe_feather_versions_cache = set()
+    return _ornithe_feather_versions_cache
+
+
+def _ornithe_game_version(version_id: str) -> Optional[str]:
+    """把 Mojang 版本 id 映射到 Ornithe 的 gameVersion。
+
+    多数正式版同名直配；少数 Ornithe 带后缀（如 1.6.2 -> 1.6.2-091847，
+    1.7.7 -> 1.7.7-101331），用「精确优先、否则唯一前缀」匹配。
+    """
+    vs = _ornithe_feather_versions()
+    if version_id in vs:
+        return version_id
+    prefixed = [g for g in vs if g.startswith(version_id + "-")]
+    return prefixed[0] if len(prefixed) == 1 else None
+
+
+def has_ornithe(version_id: str) -> bool:
+    """该版本是否有 OrnitheMC（Feather 可读名）映射。"""
+    return _ornithe_game_version(version_id) is not None
+
+
+def _resolve_ornithe(entry: VersionEntry) -> list[tuple[Path, str, str]]:
+    """Ornithe 下载解析：calamus(official->intermediary) + feather(intermediary->named)。
+
+    两者都取 v2 classifier；feather 存为 yarn-v2.jar 触发两步重映射。
+    """
+    gv = _ornithe_game_version(entry.id)
+    if gv is None:
+        return []
+    downloads: list[tuple[Path, str, str]] = []
+
+    cal = _get_json(f"{ORNITHE_META}/versions/intermediary/{gv}")
+    if cal:
+        cal_url = _maven_to_url(cal[0]["maven"], classifier="v2", maven_base=ORNITHE_MAVEN)
+        downloads.append((MAP_CACHE / entry.id / "intermediary-v2.jar",
+                          cal_url, f"{entry.id}-calamus.jar"))
+
+    feath = _get_json(f"{ORNITHE_META}/versions/feather/{gv}")
+    if feath:
+        fv = ([b for b in feath if b.get("stable")] or feath)[0]["version"]
+        feath_url = _maven_to_url(f"net.ornithemc:feather:{fv}", classifier="v2",
+                                  maven_base=ORNITHE_MAVEN)
+        downloads.append((MAP_CACHE / entry.id / "yarn-v2.jar",
+                          feath_url, f"{entry.id}-feather.jar"))
+    return downloads
+
+
+def prepare_ornithe(entry: VersionEntry, game_version: str) -> MappingArtifacts:
+    """与 prepare_yarn 读取同样的缓存文件（calamus 存为 intermediary、feather 存为 yarn-v2），
+    走两步 official->intermediary->named，仅把 kind 标为 ORNITHE。"""
+    arts = prepare_yarn(entry, game_version)
+    arts.kind = MappingKind.ORNITHE
+    return arts
+
+
 def resolve_mapping_downloads(entry: VersionEntry, vjson: dict, kind: MappingKind) -> list[tuple[Path, str, str]]:
     """将所有需要的 Mapping 文件 URL 提前吐出，供 CLI 主进度条统一并发下载。"""
     downloads = []
@@ -213,6 +286,8 @@ def resolve_mapping_downloads(entry: VersionEntry, vjson: dict, kind: MappingKin
         url = MCP_LEGACY_MAPPINGS.get(entry.id)
         if url:
             downloads.append((MAP_CACHE / entry.id / "legacy-mappings.zip", url, f"{entry.id}-legacy.zip"))
+    elif kind == MappingKind.ORNITHE:
+        downloads += _resolve_ornithe(entry)
     return downloads
 
 

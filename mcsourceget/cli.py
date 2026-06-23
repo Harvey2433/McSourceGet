@@ -25,8 +25,8 @@ from rich.panel import Panel
 from .manifest import Manifest, fetch_version_json, VersionEntry
 from .mappings import (
     MappingKind, is_unobfuscated, prepare_mojang, prepare_yarn, prepare_mcp,
-    prepare_mcp_legacy, prepare_legacy_yarn, has_mcp, has_mcp_legacy,
-    has_legacy_yarn, MappingArtifacts, resolve_mapping_downloads
+    prepare_mcp_legacy, prepare_legacy_yarn, prepare_ornithe, has_mcp, has_mcp_legacy,
+    has_legacy_yarn, has_ornithe, MappingArtifacts, resolve_mapping_downloads
 )
 from .pipeline import process_version
 from .versions import resolve_selection, _parse_mc_version
@@ -106,35 +106,41 @@ class LiveLine:
 def _era_options(vid: str):
     """返回 (era, options, default_idx)。
 
-    era==0：静默 NONE（26.1+）；era==7：该版本无任何现成映射，警告后走 NONE。
-    其余 era 为「按选项种类拼出的元组键」，仅用于把选项完全相同的连续版本归为一段、
-    一次性询问。Legacy Yarn 全量铺开：1.3~1.13 凡 Legacy Fabric 有 yarn 的都给出，
-    且作为默认（可读 + 含参数名 + 跨版本一致）。
+    era==0：静默 NONE（26.1+）；era==7：无任何现成映射，警告后走 NONE。
+    其余 era 为「按选项种类拼出的元组键」，把选项相同的连续版本归为一段、一次询问。
+    OrnitheMC（Calamus+Feather，~1.3~1.14.4）全量铺开：凡 Ornithe 覆盖的版本都加该选项。
+    默认优先级：Yarn(官方) > Legacy Yarn > OrnitheMC > Mojang > MCP > MCP Legacy > MCP-Reborn > None。
     """
     none_opt = ("None (直出)", MappingKind.NONE)
     yarn_opt = ("Yarn Mappings", MappingKind.YARN)
     lyarn_opt = ("Legacy Yarn", MappingKind.LEGACY_YARN)
+    ornithe_opt = ("OrnitheMC Mapping", MappingKind.ORNITHE)
     mojang_opt = ("Mojang Mappings", MappingKind.MOJANG)
     mcp_opt = ("MCP Mappings", MappingKind.MCP)
     mcpl_opt = ("MCP Legacy", MappingKind.MCP_LEGACY)
     reborn_opt = ("MCP-Reborn Mappings", MappingKind.MCP_REBORN)
 
-    def ask(options, default_idx):
-        # era 用选项种类元组作分组键：选项集相同的相邻版本归并、只问一次
-        return tuple(k.value for _, k in options), options, default_idx
+    _priority = [MappingKind.YARN, MappingKind.LEGACY_YARN, MappingKind.ORNITHE,
+                 MappingKind.MOJANG, MappingKind.MCP, MappingKind.MCP_LEGACY,
+                 MappingKind.MCP_REBORN, MappingKind.NONE]
 
-    def _default_legacy_yarn(options):
-        # 优先默认 Legacy Yarn，没有则默认第 1 个非 None 项，再不行就 None
-        for i, (_, k) in enumerate(options):
-            if k == MappingKind.LEGACY_YARN:
-                return i
-        return 1 if len(options) > 1 else 0
+    def ask(options):
+        kinds = [k for _, k in options]
+        default = 0
+        for p in _priority:
+            if p in kinds:
+                default = kinds.index(p)
+                break
+        return tuple(k.value for k in kinds), options, default
 
     nums = _parse_mc_version(vid)
     if not nums:
         if vid.startswith("2"):
             return 0, [none_opt], 0
-        return ask([yarn_opt, mojang_opt, none_opt, reborn_opt], 0)
+        opts = [yarn_opt, mojang_opt, none_opt, reborn_opt]
+        if has_ornithe(vid):
+            opts.append(ornithe_opt)
+        return ask(opts)
 
     if (1, 0) <= nums <= (1, 6, 4):
         opts = [none_opt]
@@ -142,29 +148,33 @@ def _era_options(vid: str):
             opts.append(mcpl_opt)
         if has_legacy_yarn(vid):
             opts.append(lyarn_opt)
-        if len(opts) == 1:
-            return 7, [none_opt], 0
-        return ask(opts, _default_legacy_yarn(opts))
+        if has_ornithe(vid):
+            opts.append(ornithe_opt)
+        return ask(opts) if len(opts) > 1 else (7, [none_opt], 0)
     if (1, 7) <= nums <= (1, 12, 2):
-        # MCP 仅对 Forge maven 真有 SRG 的版本；Legacy Yarn 补全其余缺口
         opts = [none_opt]
         if has_mcp(vid):
             opts.append(mcp_opt)
         if has_legacy_yarn(vid):
             opts.append(lyarn_opt)
-        if len(opts) == 1:
-            return 7, [none_opt], 0
-        return ask(opts, _default_legacy_yarn(opts))
+        if has_ornithe(vid):
+            opts.append(ornithe_opt)
+        return ask(opts) if len(opts) > 1 else (7, [none_opt], 0)
     if nums[:2] == (1, 13):
         opts = [none_opt]
         if has_legacy_yarn(vid):
             opts.append(lyarn_opt)
+        if has_ornithe(vid):
+            opts.append(ornithe_opt)
         opts.append(reborn_opt)
-        return ask(opts, _default_legacy_yarn(opts))
+        return ask(opts)
     if (1, 14) <= nums <= (1, 21, 4):
-        return ask([yarn_opt, mojang_opt, none_opt, reborn_opt], 0)
+        opts = [yarn_opt, mojang_opt, none_opt, reborn_opt]
+        if has_ornithe(vid):                     # Ornithe 覆盖到 1.14.4
+            opts.append(ornithe_opt)
+        return ask(opts)
     if (1, 21, 4) < nums <= (1, 21, 11):
-        return ask([yarn_opt, mojang_opt, none_opt], 0)
+        return ask([yarn_opt, mojang_opt, none_opt])
     return 0, [none_opt], 0
 
 
@@ -365,6 +375,8 @@ def _process_version(entry: VersionEntry, kind: MappingKind,
             arts = prepare_yarn(entry, entry.id)
         elif actual == MappingKind.LEGACY_YARN:
             arts = prepare_legacy_yarn(entry, entry.id)
+        elif actual == MappingKind.ORNITHE:
+            arts = prepare_ornithe(entry, entry.id)
         elif actual == MappingKind.MCP:
             arts = prepare_mcp(entry, entry.id)
         elif actual == MappingKind.MCP_LEGACY:

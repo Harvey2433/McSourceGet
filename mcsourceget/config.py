@@ -31,6 +31,13 @@ FABRIC_MAVEN = "https://maven.fabricmc.net"
 LEGACY_FABRIC_META = "https://meta.legacyfabric.net/v2"
 LEGACY_FABRIC_MAVEN = "https://repo.legacyfabric.net/legacyfabric"
 
+# OrnitheMC：覆盖 pre-classic ~ 1.14.4 的最完整老版本映射体系，逐版本生成。
+#   - Calamus = intermediary（official->intermediary，跨版本稳定名），meta 端点名为 intermediary
+#   - Feather = 可读名层（intermediary->named），对标 Yarn
+# 两步重映射：official->intermediary(calamus) + intermediary->named(feather)，复用 yarn 管线。
+ORNITHE_META = "https://meta.ornithemc.net/v3"
+ORNITHE_MAVEN = "https://maven.ornithemc.net/releases"
+
 # Forge maven：经典 MCP 的 SRG（notch->searge）与 CSV（searge->可读名）件源
 FORGE_MAVEN = "https://maven.minecraftforge.net"
 # SRG：de/oceanlabs/mcp/mcp/<ver>/mcp-<ver>-srg.zip（内含 joined.srg）
