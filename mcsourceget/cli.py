@@ -26,7 +26,7 @@ from .manifest import Manifest, fetch_version_json, VersionEntry
 from .mappings import (
     MappingKind, is_unobfuscated, prepare_mojang, prepare_yarn, prepare_mcp,
     prepare_mcp_legacy, prepare_legacy_yarn, prepare_ornithe, has_mcp, has_mcp_legacy,
-    has_legacy_yarn, has_ornithe, MappingArtifacts, resolve_mapping_downloads
+    has_legacy_yarn, has_ornithe, warm_coverage_caches, MappingArtifacts, resolve_mapping_downloads
 )
 from .pipeline import process_version
 from .versions import resolve_selection, _parse_mc_version
@@ -170,7 +170,7 @@ def _era_options(vid: str):
         return ask(opts)
     if (1, 14) <= nums <= (1, 21, 4):
         opts = [yarn_opt, mojang_opt, none_opt, reborn_opt]
-        if has_ornithe(vid):                     # Ornithe 覆盖到 1.14.4
+        if nums <= (1, 14, 4) and has_ornithe(vid):   # Ornithe 仅覆盖到 1.14.4
             opts.append(ornithe_opt)
         return ask(opts)
     if (1, 21, 4) < nums <= (1, 21, 11):
@@ -396,30 +396,49 @@ def _compile_phase(versions, group_mappings, output_dir, vjson_cache, concurrenc
     total = len(versions)
     done = 0
     start = time.time()
+    in_progress: list[str] = []          # 真正在跑的版本（worker 进入时加入、退出时移除）
+    lock = threading.Lock()
 
-    def fmt_line(current: str) -> str:
+    def fmt_line() -> str:
         pct = done / total * 100.0
+        with lock:
+            running = list(in_progress)
+        if running:
+            cur = "、".join(running[:3]) + (f" 等{len(running)}个" if len(running) > 3 else "")
+        else:
+            cur = "完成" if done >= total else "等待空闲线程"
         return (f"{_status('DeCompiling', CYAN)} [{_bar(pct, 30)}] "
-                f"{done}/{total} ({_fmt_elapsed(time.time() - start)})  {current}")
+                f"{done}/{total} ({_fmt_elapsed(time.time() - start)})  {cur}")
 
-    line.set(fmt_line("初始化"))
+    def worker(v):
+        with lock:
+            in_progress.append(v.id)
+        try:
+            return _process_version(v, group_mappings[v.id], output_dir, vjson_cache, kill_lvt, keep_work)
+        finally:
+            with lock:
+                if v.id in in_progress:
+                    in_progress.remove(v.id)
+
+    line.set(fmt_line())
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futures = {
-            ex.submit(_process_version, v, group_mappings[v.id], output_dir, vjson_cache, kill_lvt, keep_work): v.id
-            for v in versions
-        }
-        for fut in as_completed(futures):
-            vid = futures[fut]
-            try:
-                ok, msg = fut.result()
-                if ok:
-                    line.log(f"{_status('Finished', GREEN)} {vid}")
-                else:
-                    line.log(f"{_status('Failed', RED)} {vid} -> {msg}")
-            except Exception as e:
-                line.log(f"{_status('Error', RED)} {vid} -> {e}")
-            done += 1
-            line.set(fmt_line(vid))
+        futures = {ex.submit(worker, v): v.id for v in versions}
+        pending = set(futures)
+        while pending:
+            # 每 0.2s 轮询一次：即便单个版本反编译很久，进度行的计时与「正在处理」也会实时跳动
+            done_set, pending = _wait_some(pending, timeout=0.2)
+            for fut in done_set:
+                vid = futures[fut]
+                try:
+                    ok, msg = fut.result()
+                    if ok:
+                        line.log(f"{_status('Finished', GREEN)} {vid}")
+                    else:
+                        line.log(f"{_status('Failed', RED)} {vid} -> {msg}")
+                except Exception as e:
+                    line.log(f"{_status('Error', RED)} {vid} -> {e}")
+                done += 1
+            line.set(fmt_line())
     line.clear()
 
 
@@ -452,6 +471,15 @@ def main() -> None:
 
     single = len(versions) == 1
 
+    # 预热历史映射覆盖表：只要选区涉及 ≤1.14.4（或老式快照），就提前并发拉好
+    # Legacy Fabric / Ornithe 的版本清单，避免随后静默构建选项时逐项联网像卡死。
+    def _needs_cov(v: VersionEntry) -> bool:
+        n = _parse_mc_version(v.id)
+        return (n <= (1, 14, 4)) if n else (not v.id.startswith("2"))
+    if any(_needs_cov(v) for v in versions):
+        with console.status("[bold]正在加载历史版本映射表"):
+            warm_coverage_caches()
+
     segments: list[dict] = []
     for v in versions:
         era, opts, def_idx = _era_options(v.id)
@@ -462,10 +490,12 @@ def main() -> None:
                              "default": def_idx, "versions": [v]})
 
     group_mappings: dict[str, MappingKind] = {}
-    askable = [s for s in segments if s["era"] not in (0, 7)]
+    answered: dict[tuple, MappingKind] = {}   # 按「选项列表」缓存：同样的列表只问一次
     console.print()
-    for n, seg in enumerate(segments, 0):
+    for seg in segments:
         vs = seg["versions"]
+        tag = vs[0].id if vs[0].id == vs[-1].id else f"{vs[0].id} ~ {vs[-1].id}"
+
         if seg["era"] == 0:
             for v in vs:
                 group_mappings[v.id] = MappingKind.NONE
@@ -473,33 +503,35 @@ def main() -> None:
         if seg["era"] == 7:
             for v in vs:
                 group_mappings[v.id] = MappingKind.NONE
-            tag = vs[0].id if vs[0].id == vs[-1].id else f"{vs[0].id} ~ {vs[-1].id}"
             console.print(
-                f"  [yellow]![/] {tag} 无现成 MCP 映射（该版本从未发布 SRG/映射），"
+                f"  [yellow]![/] {tag} 无现成映射（从未发布 SRG/映射），"
                 f"将以 [bold]None[/]（不反混淆）直出"
             )
             continue
 
-        if single:
-            prompt = f"为 {vs[0].id} 选择反混淆映射"
-        elif vs[0].id == vs[-1].id:
-            prompt = f"为 {vs[0].id} 选择反混淆映射"
-        else:
-            prompt = f"为 {vs[0].id} ~ {vs[-1].id} 选择反混淆映射"
-        if len(askable) > 1:
-            prompt = f"[{askable.index(seg) + 1}/{len(askable)}] {prompt}"
+        sig = tuple(k for _, k in seg["options"])
 
-        chosen = _select(prompt, seg["options"], seg["default"])
+        # 完全相同的选项列表此前已选过 → 按那次选择自动沿用，不再问
+        if sig in answered:
+            kind = answered[sig]
+            for v in vs:
+                group_mappings[v.id] = kind
+            clean = next(lbl.split(" (")[0] for lbl, k in seg["options"] if k == kind)
+            console.print(f"  [dim]↺ {tag} › {clean}（沿用）[/]")
+            continue
+
+        # 新的选项列表：问一次，并记住
+        chosen = _select(f"为 {tag} 选择反混淆映射", seg["options"], seg["default"])
         label, kind = seg["options"][chosen]
         clean = label.split(" (")[0]
         for v in vs:
             group_mappings[v.id] = kind
+        answered[sig] = kind
 
         sys.stdout.write(f"\033[{len(seg['options']) + 1}A")
         for _ in range(len(seg["options"]) + 1):
             sys.stdout.write("\033[2K\033[1B")
         sys.stdout.write(f"\033[{len(seg['options']) + 1}A")
-        tag = vs[0].id if vs[0].id == vs[-1].id else f"{vs[0].id} ~ {vs[-1].id}"
         sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} {tag} › {clean}\n")
         sys.stdout.flush()
 

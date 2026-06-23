@@ -260,6 +260,19 @@ def prepare_ornithe(entry: VersionEntry, game_version: str) -> MappingArtifacts:
     return arts
 
 
+def warm_coverage_caches() -> None:
+    """并发预热 Legacy Fabric / Ornithe 的版本覆盖清单（一次性，结果进缓存）。
+
+    这些清单首次访问要联网（Ornithe feather 清单尤大），若放在 CLI 静默构建选项时
+    逐项首次触发，界面会像卡死。提前并发拉好、配合 spinner 即可消除"假死"。
+    """
+    from concurrent.futures import ThreadPoolExecutor, wait
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = [ex.submit(fn) for fn in
+                (_legacy_yarn_versions, _legacy_inter_versions, _ornithe_feather_versions)]
+        wait(futs)
+
+
 def resolve_mapping_downloads(entry: VersionEntry, vjson: dict, kind: MappingKind) -> list[tuple[Path, str, str]]:
     """将所有需要的 Mapping 文件 URL 提前吐出，供 CLI 主进度条统一并发下载。"""
     downloads = []

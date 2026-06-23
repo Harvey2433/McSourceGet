@@ -24,3 +24,5 @@ Thumbs.db
 # 临时探测/测试脚本
 test_ornithe.py
 probe_ornithe.py
+/COMMIT_MSG.txt
+/push.bat
