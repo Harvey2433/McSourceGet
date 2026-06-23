@@ -1,18 +1,19 @@
-"""处理流水线：对单个版本执行 下载jar -> 反混淆 -> 反编译 -> 输出源码。
+"""处理流水线：对单个版本执行 反混淆 -> 反编译 -> 输出源码。
 
-根据 MappingKind 走不同路线：
-  MOJANG: client.jar -> SpecialSource(ProGuard反转) -> remapped.jar -> Vineflower -> src/
-  YARN:   client.jar -> tiny-remapper(official->named via mergedv2) -> remapped.jar -> Vineflower -> src/
-  NONE:   client.jar -> Vineflower -> src/
+网络拉取已完全交给 CLI 的主进度条前置处理，此处均为纯离线操作。
 """
 
 from __future__ import annotations
 
 import csv
-import re
 import shutil
 import zipfile
 from pathlib import Path
+
+try:
+    import javalang
+except ImportError:
+    javalang = None
 
 from .config import JAR_CACHE, WORK_DIR, DECOMPILE_MAX_HEAP
 from .manifest import VersionEntry, fetch_version_json
@@ -26,30 +27,10 @@ from .tools import (
 
 
 def download_client_jar(entry: VersionEntry) -> Path:
-    vjson = fetch_version_json(entry)
-    dl = vjson["downloads"]["client"]
+    """验证客户端 jar 是否已由 CLI 统一拉取完成。"""
     dest = JAR_CACHE / f"{entry.id}-client.jar"
-
-    # 增加 ZIP 文件完整性校验，避免残缺文件导致 ZipException
-    if dest.exists() and dest.stat().st_size > 0:
-        if zipfile.is_zipfile(dest):
-            return dest
-        else:
-            dest.unlink()
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dest = dest.with_suffix(".tmp")
-
-    from .config import HTTP_TIMEOUT, SESSION
-
-    resp = SESSION.get(dl["url"], timeout=HTTP_TIMEOUT, stream=True)
-    resp.raise_for_status()
-    with open(tmp_dest, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=1024 * 64):
-            f.write(chunk)
-
-    # 下载完成后安全重命名
-    shutil.move(str(tmp_dest), str(dest))
+    if not (dest.exists() and dest.stat().st_size > 0):
+        raise FileNotFoundError(f"主下载队列缺失目标 jar，或下载不完整: {dest}")
     return dest
 
 
@@ -60,31 +41,32 @@ def _remap_mojang(client_jar: Path, arts: MappingArtifacts, version_id: str) -> 
     if out.exists():
         return out
 
-    run_java([
+    cmd_args = [
         "-jar", str(ss),
         "--in-jar", str(client_jar),
         "--out-jar", str(out),
         "--srg-in", str(arts.mojang_txt),
-        "--kill-lvt",
-    ])
+    ]
+
+    run_java(cmd_args)
     return out
 
 
 def _remap_mcp(client_jar: Path, arts: MappingArtifacts, version_id: str) -> Path:
-    """MCP 路线第一步：用 joined.srg 把 notch 字节码重映射为 searge 名。"""
     ss = ensure_specialsource()
     out = WORK_DIR / version_id / "remapped-mcp.jar"
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
         return out
 
-    run_java([
+    cmd_args = [
         "-jar", str(ss),
         "--in-jar", str(client_jar),
         "--out-jar", str(out),
         "--srg-in", str(arts.mcp_srg),
-        "--kill-lvt",
-    ])
+    ]
+
+    run_java(cmd_args)
     return out
 
 
@@ -96,7 +78,6 @@ def _remap_yarn(client_jar: Path, arts: MappingArtifacts, version_id: str) -> Pa
         return out
 
     if not arts.yarn_two_step:
-        # mergedv2：一步 official -> named（三列 tiny 含 official/intermediary/named）
         run_java([
             "-jar", str(tr),
             str(client_jar),
@@ -107,9 +88,6 @@ def _remap_yarn(client_jar: Path, arts: MappingArtifacts, version_id: str) -> Pa
         ])
         return out
 
-    # 无 mergedv2（1.14.x/1.15.x）：两步
-    #   1) official -> intermediary（用 intermediary.tiny）
-    #   2) intermediary -> named（用 yarn v2）
     mid = WORK_DIR / version_id / "remapped-intermediary.jar"
     run_java([
         "-jar", str(tr),
@@ -131,8 +109,6 @@ def _remap_yarn(client_jar: Path, arts: MappingArtifacts, version_id: str) -> Pa
 
 
 def _remap_mcp_legacy(client_jar: Path, arts: MappingArtifacts, version_id: str) -> Path:
-    """MCP(Legacy)：RetroMCP 的 mappings.tiny 直接是 混淆名 -> named，
-    复用 tiny-remapper，源命名空间随版本不同（official 或 client）。"""
     tr = ensure_tiny_remapper()
     out = WORK_DIR / version_id / "remapped-mcp-legacy.jar"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -146,37 +122,43 @@ def _remap_mcp_legacy(client_jar: Path, arts: MappingArtifacts, version_id: str)
         str(arts.legacy_tiny),
         arts.legacy_src_ns or "official",
         "named",
-        # 老映射存在少量重名冲突项（原为 RetroMCP 自家 remapper 设计），
-        # 忽略冲突，保证整体能完成重映射
         "--ignoreConflicts",
     ])
     return out
 
 
-def _decompile(jar: Path, version_id: str, output_dir: Path) -> Path:
+def _decompile(jar: Path, version_id: str, output_dir: Path, kill_lvt: bool) -> Path:
     vf = ensure_vineflower()
     decomp_out = WORK_DIR / version_id / "decompiled"
     decomp_out.mkdir(parents=True, exist_ok=True)
 
-    run_java([
+    # 严格遵照 Vineflower v1.12.0 官方文档的完整参数命名！绝不使用废弃或未注明的简写呐！
+    vf_args = [
         "-jar", str(vf),
-        "-dgs=1",   # decompile generic signatures
-        "-asc=1",   # ascii string characters
-        "-rsy=1",   # remove synthetic
-        "-ind=    ",  # 4-space indent
+        "--decompile-generics=1",
+        "--ascii-strings=1",
+        "--remove-synthetic=1",
+        "--pattern-matching=1",
+        "--variable-renaming=jad",
+    ]
+
+    # 梦梦姐亲自查阅文档确认的绝杀：直接命令 Vineflower 无视混淆表
+    if kill_lvt:
+        vf_args.append("--use-lvt-names=0")
+
+    vf_args.extend([
+        "--indent-string=    ",
         str(jar),
         str(decomp_out),
-    ], jvm_args=[f"-Xmx{DECOMPILE_MAX_HEAP}"])
+    ])
 
-    # Vineflower outputs a jar with .java files inside, or a directory.
-    # Find the result and copy .java files to output_dir.
+    run_java(vf_args, jvm_args=[f"-Xmx{DECOMPILE_MAX_HEAP}"])
+
     dest = output_dir / version_id
     dest.mkdir(parents=True, exist_ok=True)
 
-    # Check if Vineflower produced a jar or directory of java files
     decomp_jar = decomp_out / jar.with_suffix(".jar").name
     if not decomp_jar.exists():
-        # look for any jar in the output
         jars = list(decomp_out.glob("*.jar"))
         if jars:
             decomp_jar = jars[0]
@@ -187,7 +169,6 @@ def _decompile(jar: Path, version_id: str, output_dir: Path) -> Path:
                 if info.filename.endswith(".java"):
                     zf.extract(info, dest)
     else:
-        # Vineflower wrote .java files directly
         for java_file in decomp_out.rglob("*.java"):
             rel = java_file.relative_to(decomp_out)
             target = dest / rel
@@ -197,12 +178,7 @@ def _decompile(jar: Path, version_id: str, output_dir: Path) -> Path:
     return dest
 
 
-# searge token：func_<num>_<suffix>（方法）/ field_<num>_<suffix>（字段）/ p_<...>（参数）
-_SEARGE_RE = re.compile(r"\b(?:func|field|p)_\w+\b")
-
-
 def _load_csv_names(csv_dir: Path) -> dict[str, str]:
-    """把 fields/methods/params.csv 合并成 searge -> 可读名 的总表。"""
     names: dict[str, str] = {}
     for fname in ("methods.csv", "fields.csv", "params.csv"):
         path = csv_dir / fname
@@ -210,7 +186,6 @@ def _load_csv_names(csv_dir: Path) -> dict[str, str]:
             continue
         with open(path, "r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
-            # methods/fields 的列是 searge,name,...；params 的列是 param,name,...
             key_col = "param" if "param" in (reader.fieldnames or []) else "searge"
             for row in reader:
                 src = row.get(key_col)
@@ -221,27 +196,39 @@ def _load_csv_names(csv_dir: Path) -> dict[str, str]:
 
 
 def _apply_mcp_csv_names(src_dir: Path, csv_dir: Path) -> int:
-    """对反编译出的 .java 做源码级 searge->可读名替换，返回改名命中次数。"""
+    if javalang is None:
+        raise RuntimeError("请使用 pip install javalang 安装依赖，才能进行 AST 级别的安全映射替换！")
+
     names = _load_csv_names(csv_dir)
     if not names:
         return 0
 
     total = 0
-
-    def _sub(m: re.Match) -> str:
-        nonlocal total
-        tok = m.group(0)
-        repl = names.get(tok)
-        if repl is None:
-            return tok
-        total += 1
-        return repl
-
     for java_file in src_dir.rglob("*.java"):
         text = java_file.read_text(encoding="utf-8", errors="replace")
-        new_text = _SEARGE_RE.sub(_sub, text)
-        if new_text != text:
-            java_file.write_text(new_text, encoding="utf-8")
+        try:
+            tokens = list(javalang.tokenizer.tokenize(text))
+        except javalang.tokenizer.LexerError:
+            continue
+
+        lines = text.split("\n")
+        changed = False
+
+        for tok in reversed(tokens):
+            if isinstance(tok, javalang.tokenizer.Identifier) and tok.value in names:
+                repl = names[tok.value]
+                l_idx = tok.position.line - 1
+                c_idx = tok.position.column - 1
+
+                current_line = lines[l_idx]
+                if current_line[c_idx:c_idx + len(tok.value)] == tok.value:
+                    lines[l_idx] = current_line[:c_idx] + repl + current_line[c_idx + len(tok.value):]
+                    total += 1
+                    changed = True
+
+        if changed:
+            java_file.write_text("\n".join(lines), encoding="utf-8")
+
     return total
 
 
@@ -249,19 +236,19 @@ def process_version(
     entry: VersionEntry,
     arts: MappingArtifacts,
     output_dir: Path,
+    kill_lvt: bool,
+    keep_work: bool,
 ) -> Path:
-    """完整处理一个版本：下载 -> 反混淆 -> 反编译 -> 输出。返回输出目录。"""
     if arts.kind == MappingKind.MCP_REBORN:
         raise RuntimeError(
-            "MCP-Reborn 需要克隆其 Gradle 工程并执行 gradle setup（旧分支还需 "
-            "JDK 16/17），本工具尚未接入该路线，此版本已跳过。"
+            "MCP-Reborn 需要克隆其 Gradle 工程并执行 gradle setup，本工具尚未接入该路线，此版本已跳过。"
         )
 
     client_jar = download_client_jar(entry)
 
     if arts.kind == MappingKind.MOJANG:
         jar_to_decompile = _remap_mojang(client_jar, arts, entry.id)
-    elif arts.kind == MappingKind.YARN:
+    elif arts.kind in (MappingKind.YARN, MappingKind.LEGACY_YARN):
         jar_to_decompile = _remap_yarn(client_jar, arts, entry.id)
     elif arts.kind == MappingKind.MCP:
         jar_to_decompile = _remap_mcp(client_jar, arts, entry.id)
@@ -270,15 +257,14 @@ def process_version(
     else:
         jar_to_decompile = client_jar
 
-    result = _decompile(jar_to_decompile, entry.id, output_dir)
+    # 直接将 kill_lvt 参数透传给反编译阶段的 Vineflower
+    result = _decompile(jar_to_decompile, entry.id, output_dir, kill_lvt)
 
-    # MCP：反编译后再做源码级 searge->可读名替换
     if arts.kind == MappingKind.MCP and arts.mcp_csv_dir:
         _apply_mcp_csv_names(result, arts.mcp_csv_dir)
 
-    # 清理工作目录节省空间
     work = WORK_DIR / entry.id
-    if work.exists():
+    if not keep_work and work.exists():
         shutil.rmtree(work, ignore_errors=True)
 
     return result

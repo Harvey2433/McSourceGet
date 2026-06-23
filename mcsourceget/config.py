@@ -25,10 +25,28 @@ VERSION_MANIFEST = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.
 FABRIC_META = "https://meta.fabricmc.net/v2"
 FABRIC_MAVEN = "https://maven.fabricmc.net"
 
+# Legacy Fabric：社区为老版本（1.3~1.13）逐版本生成的 intermediary + yarn。
+# 这些映射是按字节码结构匹配生成的版本专属映射（稳定名），不是套邻版的 notch 名，
+# 接口与官方 Fabric 完全同构（meta v2 + maven），故 Legacy Yarn 复用 Yarn 同一条管线。
+LEGACY_FABRIC_META = "https://meta.legacyfabric.net/v2"
+LEGACY_FABRIC_MAVEN = "https://repo.legacyfabric.net/legacyfabric"
+
 # Forge maven：经典 MCP 的 SRG（notch->searge）与 CSV（searge->可读名）件源
 FORGE_MAVEN = "https://maven.minecraftforge.net"
 # SRG：de/oceanlabs/mcp/mcp/<ver>/mcp-<ver>-srg.zip（内含 joined.srg）
 MCP_SRG_URL = FORGE_MAVEN + "/de/oceanlabs/mcp/mcp/{ver}/mcp-{ver}-srg.zip"
+# Forge maven 上「确实发布过 SRG」的版本（取自 mcp 的 maven-metadata.xml）。
+# SRG 是 notch->searge 的版本专属映射，缺失的点版本（如 1.7.4~1.7.9、1.8.1~1.8.7、
+# 1.9.1/1.9.3、1.10.1 等）从未发布，且不能用邻版顶替，故经典 MCP 仅对这些版本可用。
+# 1.6.4 虽在列，但归 MCP(Legacy) 处理，这里不含。
+MCP_SRG_VERSIONS = frozenset({
+    "1.7.2", "1.7.10",
+    "1.8", "1.8.8", "1.8.9",
+    "1.9", "1.9.2", "1.9.4",
+    "1.10", "1.10.2",
+    "1.11", "1.11.1", "1.11.2",
+    "1.12", "1.12.1", "1.12.2",
+})
 # CSV：两个频道，stable 优先、snapshot 兜底；版本号形如 39-1.12 / 20180101-1.12
 MCP_CSV_CHANNELS = ("mcp_stable", "mcp_snapshot")
 MCP_CSV_METADATA = FORGE_MAVEN + "/de/oceanlabs/mcp/{channel}/maven-metadata.xml"
@@ -93,6 +111,18 @@ DECOMPILE_CONCURRENCY = int(os.environ.get("MCSG_CONCURRENCY", "4"))
 # 单个反编译 JVM 的最大堆
 DECOMPILE_MAX_HEAP = os.environ.get("MCSG_MAX_HEAP", "2g")
 
+# ---------------------------------------------------------------------------
+# 下载并发与限流
+#   - 全局并发可以开大（多主机并行更快），但「同一主机」的并发必须收着：
+#     客户端 jar 全在 Mojang 一个 CDN 上，16 条流并发会触发它的 per-IP 限速
+#     （55MB/s 瞬间掉到 KB，约 30s 后恢复）。按主机限并发即可既快又不被掐。
+#   - 下载块设小一些：块越大，慢速/限速时 done 越久才更新一次，进度看着像卡住；
+#     设成 256KB 让「剩余字节」实时往下走。
+# ---------------------------------------------------------------------------
+DOWNLOAD_CONCURRENCY = int(os.environ.get("MCSG_DOWNLOAD_CONCURRENCY", "12"))
+DOWNLOAD_PER_HOST = int(os.environ.get("MCSG_DOWNLOAD_PER_HOST", "6"))
+DOWNLOAD_CHUNK = 256 * 1024
+
 # 网络请求统一 UA / 超时
 HTTP_TIMEOUT = 60
 HTTP_HEADERS = {"User-Agent": f"MCSourceDd/1.0 OpenMapleTerminal/1.0 (local research tool)"}
@@ -111,8 +141,8 @@ try:
 except ImportError:  # 兼容旧版打包路径
     from requests.packages.urllib3.util.retry import Retry as _Retry
 
-# 同一主机的最大并发连接数（与反编译并发档位匹配，避免瞬时洪峰）
-HTTP_POOL_SIZE = 8
+# 放大连接池以匹配高速 IO 下载的 16 线程极限并发
+HTTP_POOL_SIZE = 16
 
 _retry = _Retry(
     total=3,                 # 最多重试 3 次
@@ -131,4 +161,3 @@ SESSION = _requests.Session()
 SESSION.headers.update(HTTP_HEADERS)
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
-    

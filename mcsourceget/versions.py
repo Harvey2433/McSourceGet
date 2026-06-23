@@ -64,8 +64,8 @@ def resolve_selection(manifest: Manifest, raw: str) -> list[VersionEntry]:
     if raw.lower() == "all":
         return manifest.releases()
 
-    # 区间：a-b
-    if "-" in raw and not raw.lower().startswith("1.0-"):
+    # 区间：a-b （黑子帮你把那个阻挡 1.0-1.12.2 的愚蠢判定切掉了呐）
+    if "-" in raw:
         lo, _, hi = raw.partition("-")
         lo, hi = lo.strip(), hi.strip()
         lo_e, hi_e = manifest.get(lo), manifest.get(hi)

@@ -5,34 +5,19 @@
   - tiny-remapper（Yarn 路线的字节码重映射）
   - SpecialSource（Mojang mapping 路线的字节码重映射）
 
-所有工具缓存在 ~/.mcsourceget/tools/ 下，只下载一次。
+由 CLI 主流线统一进行并行网络拉取，此处仅提供断言与调用封装。
 """
 
 from __future__ import annotations
 
 import shutil
 import subprocess
-import zipfile
 from pathlib import Path
 
-import requests
-from rich.progress import (
-    BarColumn,
-    DownloadColumn,
-    Progress,
-    TextColumn,
-    TransferSpeedColumn,
-)
-
 from .config import (
-    HTTP_HEADERS,
-    HTTP_TIMEOUT,
     SPECIALSOURCE_JAR,
-    SPECIALSOURCE_URL,
     TINY_REMAPPER_JAR,
-    TINY_REMAPPER_URL,
     VINEFLOWER_JAR,
-    VINEFLOWER_URL,
 )
 
 
@@ -48,48 +33,22 @@ def _find_java() -> str:
 JAVA = _find_java()
 
 
-def _download_tool(url: str, dest: Path, label: str) -> Path:
-    if dest.exists() and dest.stat().st_size > 0:
-        if zipfile.is_zipfile(dest):
-            return dest
-        else:
-            dest.unlink()
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dest = dest.with_suffix(".tmp")
-
-    resp = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT, stream=True)
-    resp.raise_for_status()
-    total = int(resp.headers.get("content-length", 0))
-
-    # 配合全局改为 Rust 风格
-    with Progress(
-        TextColumn("[bold green]{task.fields[action]:>12}[/]"),
-        TextColumn("{task.description}"),
-        BarColumn(),
-        DownloadColumn(),
-        TransferSpeedColumn(),
-    ) as progress:
-        task = progress.add_task(label, total=total, action="Downloading")
-        with open(tmp_dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1024 * 64):
-                f.write(chunk)
-                progress.update(task, advance=len(chunk))
-
-    shutil.move(str(tmp_dest), str(dest))
-    return dest
-
-
 def ensure_vineflower() -> Path:
-    return _download_tool(VINEFLOWER_URL, VINEFLOWER_JAR, "Vineflower")
+    if not VINEFLOWER_JAR.exists():
+        raise FileNotFoundError(f"工具缺失: Vineflower 未被统一拉取成功 ({VINEFLOWER_JAR})")
+    return VINEFLOWER_JAR
 
 
 def ensure_tiny_remapper() -> Path:
-    return _download_tool(TINY_REMAPPER_URL, TINY_REMAPPER_JAR, "tiny-remapper")
+    if not TINY_REMAPPER_JAR.exists():
+        raise FileNotFoundError(f"工具缺失: tiny-remapper 未被统一拉取成功 ({TINY_REMAPPER_JAR})")
+    return TINY_REMAPPER_JAR
 
 
 def ensure_specialsource() -> Path:
-    return _download_tool(SPECIALSOURCE_URL, SPECIALSOURCE_JAR, "SpecialSource")
+    if not SPECIALSOURCE_JAR.exists():
+        raise FileNotFoundError(f"工具缺失: SpecialSource 未被统一拉取成功 ({SPECIALSOURCE_JAR})")
+    return SPECIALSOURCE_JAR
 
 
 def run_java(
