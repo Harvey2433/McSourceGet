@@ -143,6 +143,50 @@ def _resolve_yarn_like(entry: VersionEntry, meta_base: str, maven_base: str,
     return downloads
 
 
+def _resolve_legacy_yarn(entry: VersionEntry) -> list[tuple[Path, str, str]]:
+    """Legacy Yarn 下载解析：本版直出或借邻版 yarn。
+
+    intermediary 始终用本版自己的（official 列对得上本版 jar）；yarn 层可借邻版，
+    借用时只取 intermediary->named，故强制存为 yarn-v2.jar 触发两步重映射。
+    """
+    plan = legacy_yarn_plan(entry.id)
+    if plan is None:
+        return []
+    inter_ver, yarn_ver, borrow = plan
+    downloads: list[tuple[Path, str, str]] = []
+
+    inter_list = _get_json(f"{LEGACY_FABRIC_META}/versions/intermediary/{inter_ver}")
+    if inter_list:
+        inter_url = _maven_to_url(inter_list[0]["maven"], classifier="v2",
+                                  maven_base=LEGACY_FABRIC_MAVEN)
+        downloads.append((MAP_CACHE / entry.id / "intermediary-v2.jar",
+                          inter_url, f"{entry.id}-intermediary.jar"))
+
+    builds = _get_json(f"{LEGACY_FABRIC_META}/versions/yarn/{yarn_ver}")
+    if builds:
+        yv = ([b for b in builds if b.get("stable")] or builds)[0]["version"]
+        coord = f"net.legacyfabric:yarn:{yv}"
+        merged_url = _maven_to_url(coord, classifier="mergedv2", maven_base=LEGACY_FABRIC_MAVEN)
+        try:
+            resp = SESSION.head(merged_url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+            resp.raise_for_status()
+            yarn_url, has_merged = merged_url, True
+        except requests.HTTPError:
+            yarn_url = _maven_to_url(coord, classifier="v2", maven_base=LEGACY_FABRIC_MAVEN)
+            has_merged = False
+        if borrow:
+            # 借用：必须走 intermediary->named 两步 -> 存为 v2 文件名（即便内容是 mergedv2）
+            label = f"{entry.id}-yarn(借 {yarn_ver})"
+            downloads.append((MAP_CACHE / entry.id / "yarn-v2.jar", yarn_url, label))
+        elif has_merged:
+            downloads.append((MAP_CACHE / entry.id / "yarn-mergedv2.jar",
+                              yarn_url, f"{entry.id}-yarn-mergedv2.jar"))
+        else:
+            downloads.append((MAP_CACHE / entry.id / "yarn-v2.jar",
+                              yarn_url, f"{entry.id}-yarn-v2.jar"))
+    return downloads
+
+
 def resolve_mapping_downloads(entry: VersionEntry, vjson: dict, kind: MappingKind) -> list[tuple[Path, str, str]]:
     """将所有需要的 Mapping 文件 URL 提前吐出，供 CLI 主进度条统一并发下载。"""
     downloads = []
@@ -154,8 +198,7 @@ def resolve_mapping_downloads(entry: VersionEntry, vjson: dict, kind: MappingKin
         downloads += _resolve_yarn_like(
             entry, FABRIC_META, FABRIC_MAVEN, "net.fabricmc")
     elif kind == MappingKind.LEGACY_YARN:
-        downloads += _resolve_yarn_like(
-            entry, LEGACY_FABRIC_META, LEGACY_FABRIC_MAVEN, "net.legacyfabric")
+        downloads += _resolve_legacy_yarn(entry)
     elif kind == MappingKind.MCP:
         game_version = entry.id
         srg_url = MCP_SRG_URL.format(ver=game_version)
@@ -218,6 +261,7 @@ def _maven_to_url(coord: str, *, classifier: str | None = None, ext: str = "jar"
 # Legacy Yarn（Legacy Fabric，1.3~1.13）：与 Yarn 同管线，端点不同
 # ---------------------------------------------------------------------------
 _legacy_yarn_versions_cache: Optional[set] = None
+_legacy_inter_versions_cache: Optional[set] = None
 
 
 def _legacy_yarn_versions() -> set:
@@ -232,13 +276,64 @@ def _legacy_yarn_versions() -> set:
     return _legacy_yarn_versions_cache
 
 
+def _legacy_inter_versions() -> set:
+    """Legacy Fabric 有 intermediary（跨版本稳定名）的全部版本，缓存。"""
+    global _legacy_inter_versions_cache
+    if _legacy_inter_versions_cache is None:
+        try:
+            data = _get_json(f"{LEGACY_FABRIC_META}/versions/intermediary")
+            _legacy_inter_versions_cache = {b["version"] for b in data}
+        except Exception:
+            _legacy_inter_versions_cache = set()
+    return _legacy_inter_versions_cache
+
+
+def _nearest_legacy_yarn(version_id: str) -> Optional[str]:
+    """在同一 major.minor 内挑离 version_id 最近、且有 yarn 的版本（tie 取较高补丁）。
+
+    intermediary 名跨版本稳定，故可借邻版 yarn 的 intermediary->named 层。
+    """
+    from .versions import _parse_mc_version
+    tv = _parse_mc_version(version_id)
+    if not tv:
+        return None
+    tp = tv[2] if len(tv) > 2 else 0
+    cands = []
+    for y in _legacy_yarn_versions():
+        yv = _parse_mc_version(y)
+        if yv and yv[:2] == tv[:2]:
+            cands.append((y, yv[2] if len(yv) > 2 else 0))
+    if not cands:
+        return None
+    return min(cands, key=lambda c: (abs(c[1] - tp), -c[1]))[0]
+
+
+def legacy_yarn_plan(version_id: str) -> Optional[tuple[str, str, bool]]:
+    """返回 (intermediary 版本, yarn 版本, 是否借用) 或 None。
+
+    - 本版有 yarn：直接用本版（一步 official->named）。
+    - 本版只有 intermediary：借同系列最近的 yarn（两步 official->intermediary->named）。
+    - 两者都没有（如 1.10.1）：None，无法可读化。
+    """
+    if version_id in _legacy_yarn_versions():
+        return (version_id, version_id, False)
+    if version_id in _legacy_inter_versions():
+        borrowed = _nearest_legacy_yarn(version_id)
+        if borrowed:
+            return (version_id, borrowed, True)
+    return None
+
+
 def has_legacy_yarn(version_id: str) -> bool:
-    """该版本是否有 Legacy Fabric 的 yarn（可读名）映射。"""
-    return version_id in _legacy_yarn_versions()
+    """该版本能否产出 Legacy Yarn 可读名（本版直出或借邻版 yarn）。"""
+    return legacy_yarn_plan(version_id) is not None
 
 
 def prepare_legacy_yarn(entry: VersionEntry, game_version: str) -> MappingArtifacts:
-    """与 prepare_yarn 读取同样的缓存文件，仅把 kind 标为 LEGACY_YARN。"""
+    """与 prepare_yarn 读取同样的缓存文件，仅把 kind 标为 LEGACY_YARN。
+
+    借用场景下 yarn 文件被存为 yarn-v2.jar，prepare_yarn 据此走两步重映射。
+    """
     arts = prepare_yarn(entry, game_version)
     arts.kind = MappingKind.LEGACY_YARN
     return arts

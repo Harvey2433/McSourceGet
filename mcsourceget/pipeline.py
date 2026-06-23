@@ -89,6 +89,8 @@ def _remap_yarn(client_jar: Path, arts: MappingArtifacts, version_id: str) -> Pa
         return out
 
     mid = WORK_DIR / version_id / "remapped-intermediary.jar"
+    # 两步可能用到「本版 intermediary + 借邻版 yarn」（如 1.7.9 借 1.7.10），
+    # Legacy Fabric 映射含少量重名冲突项，忽略冲突保证整体完成。
     run_java([
         "-jar", str(tr),
         str(client_jar),
@@ -96,6 +98,7 @@ def _remap_yarn(client_jar: Path, arts: MappingArtifacts, version_id: str) -> Pa
         str(arts.intermediary_tiny),
         "official",
         "intermediary",
+        "--ignoreConflicts",
     ])
     run_java([
         "-jar", str(tr),
@@ -104,6 +107,7 @@ def _remap_yarn(client_jar: Path, arts: MappingArtifacts, version_id: str) -> Pa
         str(arts.yarn_tiny),
         "intermediary",
         "named",
+        "--ignoreConflicts",
     ])
     return out
 
