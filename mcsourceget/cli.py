@@ -35,7 +35,7 @@ from .config import (
     TINY_REMAPPER_JAR, TINY_REMAPPER_URL, TINY_REMAPPER_VERSION,
     SPECIALSOURCE_JAR, SPECIALSOURCE_URL, SPECIALSOURCE_VERSION,
     HTTP_HEADERS, HTTP_TIMEOUT, DECOMPILE_CONCURRENCY, SESSION,
-    DOWNLOAD_CONCURRENCY, DOWNLOAD_PER_HOST, DOWNLOAD_CHUNK,
+    DOWNLOAD_CONCURRENCY, DOWNLOAD_PER_HOST, DOWNLOAD_CHUNK, DOWNLOAD_RETRIES,
 )
 
 console = Console()
@@ -252,6 +252,9 @@ def _human_bytes(n: int) -> str:
 def _download_phase(files: list[tuple[Path, str, str]]) -> None:
     missing = [f for f in files if not (f[0].exists() and f[0].stat().st_size > 0)]
     if not missing:
+        # 全部命中缓存：也留一条可见的总结行，避免看起来像「下载阶段凭空消失」
+        sys.stdout.write(f"{_status('Downloaded', GREEN)} {len(files)} cache hits\n")
+        sys.stdout.flush()
         return
 
     # 全局并发可大（多主机并行更快）；同一主机的并发用信号量收着，避免触发 per-IP 限速
@@ -290,28 +293,42 @@ def _download_phase(files: list[tuple[Path, str, str]]) -> None:
         sem = _host_sem(url)
         sem.acquire()
         try:
-            with SESSION.get(url, timeout=HTTP_TIMEOUT, stream=True) as r:
-                r.raise_for_status()
-                cl = int(r.headers.get("content-length", 0))
-                if cl:
+            last_err = None
+            for attempt in range(DOWNLOAD_RETRIES):
+                my_total = 0          # 本次尝试计入 total 的量（失败时回滚）
+                my_done = 0           # 本次尝试计入 done 的量
+                try:
+                    with SESSION.get(url, timeout=HTTP_TIMEOUT, stream=True) as r:
+                        r.raise_for_status()
+                        cl = int(r.headers.get("content-length", 0))
+                        if cl:
+                            my_total = cl
+                            with lock:
+                                total_bytes += cl
+                        with open(tmp, "wb") as f:
+                            # 块设小（256KB）：慢速/限速时进度也能实时往下走，而非整文件下完才跳
+                            for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK):
+                                f.write(chunk)
+                                my_done += len(chunk)
+                                with lock:
+                                    done_bytes += len(chunk)
+                    tmp.replace(dest)
                     with lock:
-                        total_bytes += cl
-                with open(tmp, "wb") as f:
-                    # 块设小（256KB）：慢速/限速时进度也能实时往下走，而非整文件下完才跳
-                    for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK):
-                        f.write(chunk)
-                        with lock:
-                            done_bytes += len(chunk)
-            tmp.replace(dest)
-        except Exception:
-            if tmp.exists():
-                tmp.unlink()
-            raise
+                        remaining_files -= 1
+                    return label
+                except Exception as e:
+                    last_err = e
+                    # 回滚本次已计入的字节/总量，清掉半成品，准备重试
+                    with lock:
+                        total_bytes -= my_total
+                        done_bytes -= my_done
+                    if tmp.exists():
+                        tmp.unlink()
+                    if attempt < DOWNLOAD_RETRIES - 1:
+                        time.sleep(1.0 * (attempt + 1))     # 退避 1s / 2s
+            raise last_err
         finally:
             sem.release()
-        with lock:
-            remaining_files -= 1
-        return label
 
     with ThreadPoolExecutor(max_workers=download_concurrency) as ex:
         futs = {ex.submit(worker, d, u, l): l for d, u, l in missing}
@@ -327,6 +344,7 @@ def _download_phase(files: list[tuple[Path, str, str]]) -> None:
                     line.log(f"{_status('Failed', RED)} {futs[fut]} -> {e}")
             line.set(fmt_line())
     line.clear()
+    sys.stdout.flush()
 
 
 def _wait_some(futures: set, timeout: float):
@@ -337,9 +355,11 @@ def _wait_some(futures: set, timeout: float):
 
 def _fetch_phase(files: list[tuple[Path, str, str]]) -> None:
     line = LiveLine()
+    checked = 0
     for dest, _url, label in files:
         if not dest.exists():
             continue
+        checked += 1
         size = dest.stat().st_size or 1
         hasher = hashlib.sha256()
         read = 0
@@ -360,6 +380,8 @@ def _fetch_phase(files: list[tuple[Path, str, str]]) -> None:
                              f"({_fmt_elapsed(now - start)})")
                     last = now
     line.clear()
+    sys.stdout.write(f"{_status('Fetching', GREEN)} Verification complete.\n")
+    sys.stdout.flush()
 
 
 def _process_version(entry: VersionEntry, kind: MappingKind,
@@ -407,7 +429,7 @@ def _compile_phase(versions, group_mappings, output_dir, vjson_cache, concurrenc
             cur = "、".join(running[:3]) + (f" 等{len(running)}个" if len(running) > 3 else "")
         else:
             cur = "完成" if done >= total else "等待空闲线程"
-        return (f"{_status('DeCompiling', CYAN)} [{_bar(pct, 30)}] "
+        return (f"{_status('Processing', CYAN)} [{_bar(pct, 30)}] "
                 f"{done}/{total} ({_fmt_elapsed(time.time() - start)})  {cur}")
 
     def worker(v):
@@ -517,7 +539,7 @@ def main() -> None:
             for v in vs:
                 group_mappings[v.id] = kind
             clean = next(lbl.split(" (")[0] for lbl, k in seg["options"] if k == kind)
-            console.print(f"  [dim]↺ {tag} › {clean}（沿用）[/]")
+            console.print(f"  [dim]↺ {tag} › {clean}（复用）[/]")
             continue
 
         # 新的选项列表：问一次，并记住
@@ -551,38 +573,38 @@ def main() -> None:
     # 梦梦姐的防卡死智能并发判断
     if len(versions) <= 1:
         custom_concurrency = 1
-        sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} 反编译并发 › 1 线程 (单版本自动推断)\n")
+        sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} 并发数量 › 1 线程\n")
     elif len(versions) < DECOMPILE_CONCURRENCY:
         custom_concurrency = len(versions)
-        sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} 反编译并发 › {custom_concurrency} 线程 (随版本数量自动下调)\n")
+        sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} 并发数量 › {custom_concurrency} 线程\n")
     else:
-        sys.stdout.write(f"\033[2K{BOLD}? 反编译并发数 (严重影响系统卡顿，务必量力而行){RESET} {DIM}(默认 {DECOMPILE_CONCURRENCY}){RESET}\n> ")
+        sys.stdout.write(f"\033[2K{BOLD}? 并发数量 (严重影响系统卡顿，务必量力而行){RESET} {DIM}(默认 {DECOMPILE_CONCURRENCY}){RESET}\n> ")
         sys.stdout.flush()
         raw_cc = sys.stdin.readline().strip()
         custom_concurrency = int(raw_cc) if raw_cc.isdigit() else DECOMPILE_CONCURRENCY
         sys.stdout.write(f"\033[2A\033[2K\033[1B\033[2K\033[1A")
-        sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} 反编译并发 › {custom_concurrency} 线程\n")
+        sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} 并发数量 › {custom_concurrency} 线程\n")
         sys.stdout.flush()
 
-    lvt_opts = [("是 (移除混淆表，赋予极高代码可读性)", True), ("否 (保留原始 $$1 等恶心变量)", False)]
-    kill_lvt = lvt_opts[_select("是否全局移除局部变量表（--kill-lvt）?", lvt_opts, 0)][1]
+    lvt_opts = [("Yes", True), ("No", False)]
+    kill_lvt = lvt_opts[_select("是否全局移除局部变量表?", lvt_opts, 0)][1]
     sys.stdout.write(f"\033[{len(lvt_opts) + 1}A" + "\033[2K\033[1B" * (len(lvt_opts) + 1) + f"\033[{len(lvt_opts) + 1}A")
-    sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} 移除 LVT › {'是' if kill_lvt else '否'}\n")
+    sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} 移除 LVT › {'Yes' if kill_lvt else 'No'}\n")
     sys.stdout.flush()
 
-    work_opts = [("否 (完成后自动清理，节省磁盘)", False), ("是 (保留 .jar 等临时文件，便于调试)", True)]
-    keep_work = work_opts[_select("调试选项: 是否保留工作目录（work）以供分析?", work_opts, 0)][1]
+    work_opts = [("No", False), ("Yes", True)]
+    keep_work = work_opts[_select("是否保留工作目录?", work_opts, 0)][1]
     sys.stdout.write(f"\033[{len(work_opts) + 1}A" + "\033[2K\033[1B" * (len(work_opts) + 1) + f"\033[{len(work_opts) + 1}A")
-    sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} 保留工作目录 › {'是' if keep_work else '否'}\n")
+    sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} 保留工作目录 › {'Yes' if keep_work else 'No'}\n")
     sys.stdout.flush()
 
     tag_summary = versions[0].id if single else f"{versions[0].id} ~ {versions[-1].id}"
-    confirm_opts = [("确定启动", True), ("取消并退出", False)]
-    if not confirm_opts[_select(f"共 {len(versions)} 个版本 ({tag_summary}) -> {output_dir}，确认执行?", confirm_opts, 0)][1]:
-        console.print("[yellow]已取消操作。[/]")
+    confirm_opts = [("Yes", True), ("No", False)]
+    if not confirm_opts[_select(f"总计 {len(versions)} 个版本 ({tag_summary}) -> {output_dir}，确认?", confirm_opts, 0)][1]:
+        console.print("[yellow]操作已被取消.[/]")
         sys.exit(0)
     sys.stdout.write(f"\033[{len(confirm_opts) + 1}A" + "\033[2K\033[1B" * (len(confirm_opts) + 1) + f"\033[{len(confirm_opts) + 1}A")
-    sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} 准备就绪，流水线启动...\n\n")
+    sys.stdout.write(f"  {GREEN}{'OK':>2}{RESET} Processing has begun.\n\n")
     sys.stdout.flush()
     # ---- 交互参数收集结束 ----
 
@@ -621,13 +643,20 @@ def main() -> None:
             line.set(f"{_status('Resolving', CYAN)} metadata "
                      f"[{_bar(pct, 30)}] {pct:>3.0f}% ({got}/{total_meta})")
     line.clear()
+    sys.stdout.write(f"{_status('Resolving', GREEN)} Analysis complete.\n")
+    sys.stdout.flush()
+    console.print()
 
-    # IO 下载阶段：已经解绑了 CPU 的限制并发，内部强制走极速下载列队
+    # IO 下载阶段：多主机并行 + 同主机限流 + 单文件失败重试
     _download_phase(files)
+    console.print()
+    # 完整性校验
     _fetch_phase(files)
+    console.print()
 
     # CPU 反编译阶段：严格遵从用户输入或推断的安全并发数
     _compile_phase(versions, group_mappings, output_dir, vjson_cache, custom_concurrency, kill_lvt, keep_work)
+    console.print(f"\n[bold green]All processes completed in[/] -> [bold]{output_dir}[/]")
 
 
 if __name__ == "__main__":

@@ -54,16 +54,10 @@ class Manifest:
     # -- 构造 ---------------------------------------------------------------
     @classmethod
     def load(cls, *, force: bool = False) -> "Manifest":
-        """拉取（或读缓存）版本清单。"""
-        cache = MAP_CACHE.parent / "version_manifest_v2.json"
-        data: dict
-        if cache.exists() and not force:
-            data = json.loads(cache.read_text(encoding="utf-8"))
-        else:
-            resp = SESSION.get(VERSION_MANIFEST, timeout=HTTP_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            cache.write_text(json.dumps(data), encoding="utf-8")
+        """每次都联网拉取最新版本清单（不读磁盘缓存，避免新版本/新映射看不到）。"""
+        resp = SESSION.get(VERSION_MANIFEST, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
 
         raw = data["versions"]
         # 清单本身是「最新在前」，倒过来得到时间正序，便于区间切片
@@ -89,14 +83,7 @@ class Manifest:
 
 
 def fetch_version_json(entry: VersionEntry) -> dict:
-    """获取并缓存单个版本的详细 JSON。"""
-    cache = MAP_CACHE.parent / "version_json" / f"{entry.id}.json"
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    if cache.exists():
-        return json.loads(cache.read_text(encoding="utf-8"))
-
+    """每次都联网获取单个版本的详细 JSON（不读磁盘缓存）。"""
     resp = SESSION.get(entry.url, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
-    data = resp.json()
-    cache.write_text(json.dumps(data), encoding="utf-8")
-    return data
+    return resp.json()

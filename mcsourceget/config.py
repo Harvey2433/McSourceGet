@@ -115,8 +115,10 @@ SPECIALSOURCE_JAR = TOOL_CACHE / f"SpecialSource-{SPECIALSOURCE_VERSION}-shaded.
 # ---------------------------------------------------------------------------
 # 同时反编译的版本数（每个约 -Xmx 上限，峰值内存 ≈ 该值 × DECOMPILE_MAX_HEAP）
 DECOMPILE_CONCURRENCY = int(os.environ.get("MCSG_CONCURRENCY", "4"))
-# 单个反编译 JVM 的最大堆
-DECOMPILE_MAX_HEAP = os.environ.get("MCSG_MAX_HEAP", "2g")
+# 单个反编译 JVM 的最大堆（现代大 jar 在 2g 下会 GC 抖动→变慢→超时，给到 4g）
+DECOMPILE_MAX_HEAP = os.environ.get("MCSG_MAX_HEAP", "4g")
+# 单个反编译进程超时秒数（现代大 jar 反编译耗时较长，默认 30 分钟）
+DECOMPILE_TIMEOUT = int(os.environ.get("MCSG_DECOMPILE_TIMEOUT", "1800"))
 
 # ---------------------------------------------------------------------------
 # 下载并发与限流
@@ -128,7 +130,9 @@ DECOMPILE_MAX_HEAP = os.environ.get("MCSG_MAX_HEAP", "2g")
 # ---------------------------------------------------------------------------
 DOWNLOAD_CONCURRENCY = int(os.environ.get("MCSG_DOWNLOAD_CONCURRENCY", "12"))
 DOWNLOAD_PER_HOST = int(os.environ.get("MCSG_DOWNLOAD_PER_HOST", "6"))
-DOWNLOAD_CHUNK = 256 * 1024
+DOWNLOAD_CHUNK = 128 * 1024
+# 单个文件下载失败时的应用层重试次数（含首次；配合 SESSION 的连接级重试兜断流）
+DOWNLOAD_RETRIES = int(os.environ.get("MCSG_DOWNLOAD_RETRIES", "3"))
 
 # 网络请求统一 UA / 超时
 HTTP_TIMEOUT = 60

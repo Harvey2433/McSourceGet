@@ -15,7 +15,7 @@ try:
 except ImportError:
     javalang = None
 
-from .config import JAR_CACHE, WORK_DIR, DECOMPILE_MAX_HEAP
+from .config import JAR_CACHE, WORK_DIR, DECOMPILE_MAX_HEAP, DECOMPILE_TIMEOUT
 from .manifest import VersionEntry, fetch_version_json
 from .mappings import MappingArtifacts, MappingKind
 from .tools import (
@@ -156,7 +156,7 @@ def _decompile(jar: Path, version_id: str, output_dir: Path, kill_lvt: bool) -> 
         str(decomp_out),
     ])
 
-    run_java(vf_args, jvm_args=[f"-Xmx{DECOMPILE_MAX_HEAP}"])
+    run_java(vf_args, jvm_args=[f"-Xmx{DECOMPILE_MAX_HEAP}"], timeout=DECOMPILE_TIMEOUT)
 
     dest = output_dir / version_id
     dest.mkdir(parents=True, exist_ok=True)

@@ -35,13 +35,13 @@ JAVA = _find_java()
 
 def ensure_vineflower() -> Path:
     if not VINEFLOWER_JAR.exists():
-        raise FileNotFoundError(f"工具缺失: Vineflower 未被统一拉取成功 ({VINEFLOWER_JAR})")
+        raise FileNotFoundError(f"工具缺失: Vineflower 未拉取成功 ({VINEFLOWER_JAR})")
     return VINEFLOWER_JAR
 
 
 def ensure_tiny_remapper() -> Path:
     if not TINY_REMAPPER_JAR.exists():
-        raise FileNotFoundError(f"工具缺失: tiny-remapper 未被统一拉取成功 ({TINY_REMAPPER_JAR})")
+        raise FileNotFoundError(f"工具缺失: tiny-remapper 未拉取成功 ({TINY_REMAPPER_JAR})")
     return TINY_REMAPPER_JAR
 
 
@@ -56,6 +56,7 @@ def run_java(
     *,
     cwd: Path | None = None,
     jvm_args: list[str] | None = None,
+    timeout: int = 1600,
 ) -> subprocess.CompletedProcess:
     """执行 java 命令。jvm_args 在 -jar 之前注入（如 -Xmx 限堆）。"""
     cmd = [JAVA] + (jvm_args or []) + args
@@ -64,11 +65,11 @@ def run_java(
         cwd=cwd,
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=timeout,
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"Java 命令执行失败 (exit {result.returncode}):\n"
+            f"命令执行失败 (exit {result.returncode}):\n"
             f"cmd: {' '.join(cmd)}\n"
             f"stderr: {result.stderr[:2000]}"
         )
